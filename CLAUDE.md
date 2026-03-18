@@ -145,7 +145,7 @@ Antes de empezar, dejame verificar que tu entorno esta listo...
 
 2. **Crear carpetas necesarias** (si no existen):
    ```bash
-   mkdir -p agent config knowledge tests
+   mkdir -p agent/providers config knowledge tests
    ```
 
 3. **Generar requirements.txt** con las dependencias del stack
@@ -385,7 +385,7 @@ class ProveedorWhatsApp(ABC):
         """Envía un mensaje de texto. Retorna True si fue exitoso."""
         ...
 
-    async def validar_webhook(self, request: Request) -> dict | None:
+    async def validar_webhook(self, request: Request) -> dict | int | None:
         """Verificación GET del webhook (solo Meta la requiere). Retorna respuesta o None."""
         return None
 ```
@@ -500,7 +500,7 @@ class ProveedorMeta(ProveedorWhatsApp):
         self.verify_token = os.getenv("META_VERIFY_TOKEN", "agentkit-verify")
         self.api_version = "v21.0"
 
-    async def validar_webhook(self, request: Request) -> dict | None:
+    async def validar_webhook(self, request: Request) -> dict | int | None:
         """Meta requiere verificación GET con hub.verify_token."""
         params = request.query_params
         mode = params.get("hub.mode")
@@ -636,8 +636,10 @@ from agent.providers import obtener_proveedor
 
 load_dotenv()
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
+# Configuración de logging según entorno
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
+logging.basicConfig(level=log_level)
 logger = logging.getLogger("agentkit")
 
 # Proveedor de WhatsApp (se configura en .env con WHATSAPP_PROVIDER)
@@ -741,16 +743,33 @@ logger = logging.getLogger("agentkit")
 # Cliente de Anthropic
 client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Cargar system prompt desde archivo YAML
-def cargar_system_prompt() -> str:
-    """Lee el system prompt desde config/prompts.yaml."""
+
+def cargar_config_prompts() -> dict:
+    """Lee toda la configuración desde config/prompts.yaml."""
     try:
         with open("config/prompts.yaml", "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-            return config.get("system_prompt", "Eres un asistente útil.")
+            return yaml.safe_load(f) or {}
     except FileNotFoundError:
         logger.error("config/prompts.yaml no encontrado")
-        return "Eres un asistente útil. Responde en español."
+        return {}
+
+
+def cargar_system_prompt() -> str:
+    """Lee el system prompt desde config/prompts.yaml."""
+    config = cargar_config_prompts()
+    return config.get("system_prompt", "Eres un asistente útil. Responde en español.")
+
+
+def obtener_mensaje_error() -> str:
+    """Retorna el mensaje de error configurado en prompts.yaml."""
+    config = cargar_config_prompts()
+    return config.get("error_message", "Lo siento, estoy teniendo problemas técnicos. Por favor intenta de nuevo en unos minutos.")
+
+
+def obtener_mensaje_fallback() -> str:
+    """Retorna el mensaje de fallback configurado en prompts.yaml."""
+    config = cargar_config_prompts()
+    return config.get("fallback_message", "Disculpa, no entendí tu mensaje. ¿Podrías reformularlo?")
 
 
 async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
@@ -764,6 +783,10 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
     Returns:
         La respuesta generada por Claude
     """
+    # Si el mensaje es muy corto o vacío, usar fallback
+    if not mensaje or len(mensaje.strip()) < 2:
+        return obtener_mensaje_fallback()
+
     system_prompt = cargar_system_prompt()
 
     # Construir mensajes para la API
@@ -794,13 +817,7 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
 
     except Exception as e:
         logger.error(f"Error Claude API: {e}")
-        # Cargar mensaje de error desde prompts.yaml
-        try:
-            with open("config/prompts.yaml", "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-                return config.get("error_message", "Lo siento, tengo problemas técnicos. Intenta de nuevo.")
-        except:
-            return "Lo siento, estoy teniendo problemas técnicos. Por favor intenta de nuevo en unos minutos."
+        return obtener_mensaje_error()
 ```
 
 #### 3.6 — `agent/memory.py`
@@ -905,39 +922,108 @@ async def limpiar_historial(telefono: str):
         result = await session.execute(query)
         mensajes = result.scalars().all()
         for msg in mensajes:
-            await session.delete(msg)
+            session.delete(msg)
         await session.commit()
 ```
 
 #### 3.7 — `agent/tools.py`
 
 Genera herramientas ESPECÍFICAS según los casos de uso elegidos por el usuario.
+Usa este template base y agrega las funciones según el caso:
 
-**Si eligió "Responder preguntas frecuentes":**
-- Función que busca en los archivos de /knowledge
-- Función que formatea respuestas de FAQ
+```python
+# agent/tools.py — Herramientas del agente
+# Generado por AgentKit
 
-**Si eligió "Agendar citas":**
-- Estructura de slots disponibles
-- Función para reservar un slot
-- Función para cancelar/reagendar
-- Mensaje de confirmación
+"""
+Herramientas específicas del negocio.
+Estas funciones extienden las capacidades del agente más allá de responder texto.
+Claude Code genera las funciones según los casos de uso elegidos en la entrevista.
+"""
 
-**Si eligió "Tomar pedidos":**
-- Carrito de compras en memoria
-- Agregar/quitar productos
-- Calcular total
-- Confirmar pedido
+import os
+import yaml
+import logging
+from datetime import datetime
 
-**Si eligió "Ventas / Leads":**
-- Función para calificar lead (preguntas clave)
-- Función para registrar interés
-- Escalamiento a vendedor humano
+logger = logging.getLogger("agentkit")
 
-**Si eligió "Soporte post-venta":**
-- Función para registrar ticket
-- Preguntas de diagnóstico
-- Escalamiento si no se resuelve
+
+def cargar_info_negocio() -> dict:
+    """Carga la información del negocio desde business.yaml."""
+    try:
+        with open("config/business.yaml", "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.error("config/business.yaml no encontrado")
+        return {}
+
+
+def obtener_horario() -> dict:
+    """Retorna el horario de atención del negocio."""
+    info = cargar_info_negocio()
+    return {
+        "horario": info.get("negocio", {}).get("horario", "No disponible"),
+        "esta_abierto": True,  # TODO: calcular según hora actual y horario
+    }
+
+
+def buscar_en_knowledge(consulta: str) -> str:
+    """
+    Busca información relevante en los archivos de /knowledge.
+    Retorna el contenido más relevante encontrado.
+    """
+    resultados = []
+    knowledge_dir = "knowledge"
+
+    if not os.path.exists(knowledge_dir):
+        return "No hay archivos de conocimiento disponibles."
+
+    for archivo in os.listdir(knowledge_dir):
+        ruta = os.path.join(knowledge_dir, archivo)
+        if archivo.startswith(".") or not os.path.isfile(ruta):
+            continue
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                contenido = f.read()
+                # Búsqueda simple por coincidencia de texto
+                if consulta.lower() in contenido.lower():
+                    resultados.append(f"[{archivo}]: {contenido[:500]}")
+        except (UnicodeDecodeError, IOError):
+            continue
+
+    if resultados:
+        return "\n---\n".join(resultados)
+    return "No encontré información específica sobre eso en mis archivos."
+
+
+# ════════════════════════════════════════════════════════════
+# Claude Code: agrega aquí las funciones específicas según
+# el caso de uso elegido por el usuario. Ejemplos:
+#
+# Si FAQ → buscar_en_knowledge() ya está listo arriba
+#
+# Si AGENDAR CITAS:
+# def obtener_slots_disponibles(fecha: str) -> list[dict]: ...
+# def reservar_cita(telefono, fecha, hora, servicio): ...
+# def cancelar_cita(telefono, cita_id): ...
+#
+# Si TOMAR PEDIDOS:
+# def agregar_al_carrito(telefono, producto, cantidad): ...
+# def ver_carrito(telefono) -> list[dict]: ...
+# def confirmar_pedido(telefono) -> dict: ...
+#
+# Si VENTAS / LEADS:
+# def registrar_lead(telefono, nombre, interes): ...
+# def calificar_lead(telefono) -> str: ...
+# def escalar_a_vendedor(telefono, contexto): ...
+#
+# Si SOPORTE:
+# def crear_ticket(telefono, problema) -> str: ...
+# def consultar_ticket(ticket_id) -> dict: ...
+# def escalar_ticket(ticket_id, razon): ...
+# ════════════════════════════════════════════════════════════
+```
 
 Siempre incluir un archivo `agent/__init__.py` vacío.
 
