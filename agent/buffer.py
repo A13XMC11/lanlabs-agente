@@ -25,8 +25,9 @@ BUFFER_KEY_PREFIX = "whatsapp:buffer:"
 MAX_MESSAGES_PER_BUFFER = 15  # Backpressure limit
 REDIS_TIMEOUT = 5  # segundos para operaciones Redis
 
-# Storage para timers (en producción, usar Redis)
+# Storage para timers y eventos de completación
 _timers: Dict[str, asyncio.Task] = {}
+_buffer_events: Dict[str, asyncio.Event] = {}
 
 
 class MessageBuffer:
@@ -135,20 +136,27 @@ class MessageBuffer:
                 }
                 logger.info("BUFFER_START", extra={"user_id": user_id})
 
-            # 7. CLEAR EXISTING TIMER
+            # 7. CLEAR EXISTING TIMER AND EVENTS
             timer_key = f"{buffer_key}:timer"
             if timer_key in _timers:
                 _timers[timer_key].cancel()
+            if buffer_key in _buffer_events:
+                _buffer_events[buffer_key].clear()
 
             # 8. SET NEW TIMER
             async def timeout_handler():
                 await asyncio.sleep(BUFFER_TIMEOUT_MS / 1000)
-                # Mark as ready for processing (signal to main.py)
-                await self.redis_client.setex(buffer_key, 300, json.dumps(buffer))
-                # La lógica de procesamiento está en main.py
+                # Señaliza que el buffer está listo
+                if buffer_key in _buffer_events:
+                    _buffer_events[buffer_key].set()
+                logger.info(
+                    "BUFFER_TIMEOUT_COMPLETED",
+                    extra={"user_id": user_id, "msg_count": len(buffer["messages"])},
+                )
 
             task = asyncio.create_task(timeout_handler())
             _timers[timer_key] = task
+            _buffer_events[buffer_key] = asyncio.Event()
 
             # 9. SAVE BUFFER TO REDIS
             try:
@@ -161,7 +169,25 @@ class MessageBuffer:
                 # Degrada: devuelve inmediatamente
                 return buffer
 
-            return None  # Señal: sigue buffering
+            # 10. WAIT FOR TIMEOUT TO COMPLETE
+            event = _buffer_events[buffer_key]
+            try:
+                await asyncio.wait_for(event.wait(), timeout=BUFFER_TIMEOUT_MS / 1000 + 0.5)
+                # Timeout completado - devuelve el buffer
+                logger.info(
+                    "BUFFER_COMPLETE",
+                    extra={"user_id": user_id, "msg_count": len(buffer["messages"])},
+                )
+                # Limpia
+                await self.redis_client.delete(buffer_key)
+                if timer_key in _timers:
+                    del _timers[timer_key]
+                if buffer_key in _buffer_events:
+                    del _buffer_events[buffer_key]
+                return buffer
+            except asyncio.TimeoutError:
+                # Fallback: devuelve el buffer aunque haya timeout
+                return buffer
 
         except Exception as err:
             logger.error(
