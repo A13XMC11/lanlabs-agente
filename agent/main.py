@@ -7,6 +7,7 @@ Funciona con cualquier proveedor (Whapi, Meta, Twilio) gracias a la capa de prov
 """
 
 import os
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
