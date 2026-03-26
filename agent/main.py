@@ -211,8 +211,25 @@ async def webhook_handler(request: Request):
             )
 
         # 2. ESPERAR A QUE LOS BUFFERS SE COMPLETEN
-        # Espera a que se cumpla el timeout de pausa de mensajes
-        await asyncio.sleep((int(os.getenv("BUFFER_TIMEOUT_MS", 2500)) / 1000) + 0.5)
+        # Espera hasta que todos los buffers estén ready o se cumpla el timeout
+        buffer_timeout_sec = int(os.getenv("BUFFER_TIMEOUT_MS", 2500)) / 1000
+        end_time = time.time() + buffer_timeout_sec + 0.5
+
+        while time.time() < end_time and user_ids_seen:
+            # Verifica qué buffers están ready sin consumirlos
+            ready_users = []
+            for user_id in user_ids_seen:
+                ready_key = f"whatsapp:buffer:{user_id}:ready"
+                is_ready = await buffer_manager.redis_client.exists(ready_key) if buffer_manager.connected else False
+                if is_ready:
+                    ready_users.append(user_id)
+
+            # Si todos están ready, sale inmediatamente (no espera el timeout completo)
+            if len(ready_users) == len(user_ids_seen):
+                break
+
+            # Espera 100ms antes de verificar de nuevo
+            await asyncio.sleep(0.1)
 
         # 3. VERIFICAR Y PROCESAR BUFFERS COMPLETADOS
         for user_id in user_ids_seen:
