@@ -136,10 +136,18 @@ async def get_available_slots(
 
                     if is_free and slot_end.time().hour <= 18:
                         slot_id = f"slot_{len(slots)+1}"
-                        # Formato para usuario
-                        day_name = search_date.strftime("%A").replace("Monday", "Lunes").replace("Tuesday", "Martes").replace("Wednesday", "Miércoles").replace("Thursday", "Jueves").replace("Friday", "Viernes").replace("Saturday", "Sábado")
-                        month_abbr = search_date.strftime("%b").replace("Mar", "Mar").replace("Apr", "Abr")
-                        display = f"{day_name} {search_date.day} {month_abbr} · {current_time.strftime('%I:%M%p').lstrip('0').lower()}"
+                        # Formato para usuario (simple y confiable)
+                        hour = current_time.hour
+                        minute = current_time.minute
+                        ampm = "am" if hour < 12 else "pm"
+                        hour_12 = hour if hour <= 12 else hour - 12
+                        if hour_12 == 0:
+                            hour_12 = 12
+                        time_str = f"{hour_12}:{minute:02d}{ampm}"
+
+                        day_map = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+                        day_name = day_map.get(search_date.weekday(), "Día")
+                        display = f"{day_name} {search_date.day} Mar · {time_str}"
 
                         slots.append({
                             "id": slot_id,
