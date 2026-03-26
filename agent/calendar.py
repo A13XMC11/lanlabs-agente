@@ -244,7 +244,8 @@ Modalidad: {'Virtual (Videollamada)' if virtual else 'Presencial (Quito)'}
         if virtual and "conferenceData" in created_event:
             meet_link = created_event["conferenceData"].get("entryPoints", [{}])[0].get("uri")
 
-        result_link = meet_link if virtual else event_link
+        # Si es virtual, usar meet_link si existe, sino usar event_link como fallback
+        result_link = (meet_link or event_link) if virtual else event_link
 
         logger.info(
             "EVENT_CREATED",
