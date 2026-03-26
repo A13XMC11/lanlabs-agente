@@ -20,6 +20,16 @@ from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
 from agent.providers import obtener_proveedor
 from agent.buffer import buffer_manager
+from agent.handoff import (
+    is_paused,
+    pause_conversation,
+    resume_conversation,
+    is_handoff_request,
+    is_operator_command,
+    notify_operator,
+    get_resume_confirmation_message,
+    get_pause_confirmation_message,
+)
 
 load_dotenv()
 
@@ -94,22 +104,64 @@ async def webhook_handler(request: Request):
     """
     Recibe mensajes de WhatsApp via el proveedor configurado.
     Usa buffering para agrupar múltiples mensajes → respuesta unificada.
+    Maneja pausa/reanudación para transferencia a operador humano.
     """
     try:
         # Parsear webhook — el proveedor normaliza el formato
         mensajes = await proveedor.parsear_webhook(request)
         user_ids_seen = set()
 
-        # 1. PROCESAR TODOS LOS MENSAJES (agregar al buffer)
+        # 1. PROCESAR TODOS LOS MENSAJES (agregar al buffer, detectar handoff/commands)
         for msg in mensajes:
-            # Ignorar mensajes propios o vacíos
-            if msg.es_propio or not msg.texto:
+            # Ignorar mensajes vacíos
+            if not msg.texto:
                 continue
 
             logger.info(
                 "WEBHOOK_MESSAGE_RECEIVED",
-                extra={"user_id": msg.telefono, "message_id": msg.mensaje_id},
+                extra={"user_id": msg.telefono, "message_id": msg.mensaje_id, "es_propio": msg.es_propio},
             )
+
+            # ===== COMANDOS DEL OPERADOR =====
+            if msg.es_propio:
+                es_cmd, accion, target_user = is_operator_command(msg.texto, msg.telefono)
+                if es_cmd:
+                    if accion == "reanudar":
+                        await resume_conversation(buffer_manager.redis_client, target_user)
+                        await proveedor.enviar_mensaje(
+                            msg.telefono, get_resume_confirmation_message(target_user)
+                        )
+                    elif accion == "pausar":
+                        await pause_conversation(buffer_manager.redis_client, target_user)
+                        await proveedor.enviar_mensaje(
+                            msg.telefono, get_pause_confirmation_message(target_user)
+                        )
+                    logger.info("OPERATOR_COMMAND_EXECUTED", extra={"command": accion, "target": target_user})
+                # Ignorar otros mensajes propios (respuestas del operador al cliente)
+                continue
+
+            # ===== IGNORAR SI CONVERSACIÓN ESTÁ PAUSADA =====
+            paused = await is_paused(buffer_manager.redis_client, msg.telefono)
+            if paused:
+                logger.info(
+                    "MESSAGE_IGNORED_PAUSED",
+                    extra={"user_id": msg.telefono, "reason": "conversation_paused"},
+                )
+                # No respondemos, el operador está atendiendo
+                continue
+
+            # ===== DETECTAR SOLICITUD DE ATENCIÓN HUMANA =====
+            if is_handoff_request(msg.texto):
+                await pause_conversation(buffer_manager.redis_client, msg.telefono)
+                await proveedor.enviar_mensaje(
+                    msg.telefono, "Un momento, te atiendo enseguida 🙏"
+                )
+                await notify_operator(proveedor, msg.telefono, msg.texto)
+                logger.info(
+                    "HANDOFF_INITIATED",
+                    extra={"user_id": msg.telefono, "message": msg.texto[:50]},
+                )
+                continue
 
             user_ids_seen.add(msg.telefono)
 
