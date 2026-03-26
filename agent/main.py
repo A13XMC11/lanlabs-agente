@@ -30,6 +30,12 @@ from agent.handoff import (
     get_resume_confirmation_message,
     get_pause_confirmation_message,
 )
+from agent.scheduler import (
+    is_scheduling,
+    is_scheduling_request,
+    process_scheduling_step,
+)
+from agent.calendar import get_calendar_service
 
 load_dotenv()
 
@@ -49,10 +55,15 @@ logger.setLevel(log_level)
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 
+# Google Calendar service (se inicializa en lifespan)
+calendar_service = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicializa la base de datos y Redis al arrancar el servidor."""
+    global calendar_service
+
     try:
         await inicializar_db()
         logger.info("DATABASE_INITIALIZED", extra={"status": "ok"})
@@ -63,6 +74,13 @@ async def lifespan(app: FastAPI):
             logger.info("REDIS_CONNECTED", extra={"status": "ok"})
         else:
             logger.warning("REDIS_UNAVAILABLE", extra={"degradation": "will_respond_per_message"})
+
+        # Inicializar Google Calendar service
+        calendar_service = get_calendar_service()
+        if calendar_service:
+            logger.info("GOOGLE_CALENDAR_SERVICE_INITIALIZED", extra={"status": "ok"})
+        else:
+            logger.warning("GOOGLE_CALENDAR_SERVICE_UNAVAILABLE", extra={"degradation": "scheduling_disabled"})
 
         logger.info(
             "SERVER_STARTED",
@@ -162,6 +180,26 @@ async def webhook_handler(request: Request):
                     extra={"user_id": msg.telefono, "message": msg.texto[:50]},
                 )
                 continue
+
+            # ===== FLUJO DE AGENDAMIENTO DE CITAS =====
+            scheduling = await is_scheduling(buffer_manager.redis_client, msg.telefono)
+            if scheduling or is_scheduling_request(msg.texto):
+                scheduling_response = await process_scheduling_step(
+                    buffer_manager.redis_client,
+                    proveedor,
+                    calendar_service,
+                    msg.telefono,
+                    msg.texto
+                )
+                if scheduling_response:
+                    await guardar_mensaje(msg.telefono, "user", msg.texto)
+                    await guardar_mensaje(msg.telefono, "assistant", scheduling_response)
+                    await proveedor.enviar_mensaje(msg.telefono, scheduling_response)
+                    logger.info(
+                        "SCHEDULING_RESPONSE_SENT",
+                        extra={"user_id": msg.telefono, "in_process": scheduling},
+                    )
+                    continue
 
             user_ids_seen.add(msg.telefono)
 

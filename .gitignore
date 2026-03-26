@@ -1,5 +1,6 @@
 # Secretos — NUNCA subir a GitHub
 .env
+credentials/
 
 # Base de datos local
 *.db
