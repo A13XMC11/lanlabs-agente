@@ -97,7 +97,9 @@ async def webhook_handler(request: Request):
     try:
         # Parsear webhook — el proveedor normaliza el formato
         mensajes = await proveedor.parsear_webhook(request)
+        user_ids_seen = set()
 
+        # 1. PROCESAR TODOS LOS MENSAJES (agregar al buffer)
         for msg in mensajes:
             # Ignorar mensajes propios o vacíos
             if msg.es_propio or not msg.texto:
@@ -108,15 +110,25 @@ async def webhook_handler(request: Request):
                 extra={"user_id": msg.telefono, "message_id": msg.mensaje_id},
             )
 
+            user_ids_seen.add(msg.telefono)
+
             # BUFFERING: Agrupa múltiples mensajes
-            completed_buffer = await buffer_manager.handle_message(
+            await buffer_manager.handle_message(
                 user_id=msg.telefono,
                 text=msg.texto,
                 message_id=msg.mensaje_id,
             )
 
-            # Si no hay buffer completado, continúa esperando más mensajes
+        # 2. ESPERAR A QUE LOS BUFFERS SE COMPLETEN
+        # Espera a que se cumpla el timeout de pausa de mensajes
+        await asyncio.sleep((int(os.getenv("BUFFER_TIMEOUT_MS", 2500)) / 1000) + 0.5)
+
+        # 3. VERIFICAR Y PROCESAR BUFFERS COMPLETADOS
+        for user_id in user_ids_seen:
+            completed_buffer = await buffer_manager.check_and_get_completed_buffer(user_id)
+
             if completed_buffer is None:
+                # Buffer aún no completado (puede haber más mensajes)
                 continue
 
             # ===== BUFFER COMPLETADO: PROCESAR =====
@@ -127,34 +139,34 @@ async def webhook_handler(request: Request):
                 combined_context = buffer_manager.combine_messages(completed_buffer["messages"])
 
                 logger.info(
-                    "BUFFER_COMPLETE",
+                    "BUFFER_READY_TO_PROCESS",
                     extra={
-                        "user_id": msg.telefono,
+                        "user_id": user_id,
                         "msg_count": len(completed_buffer["messages"]),
                         "combined_length": len(combined_context),
                     },
                 )
 
                 # Obtener historial ANTES de guardar el mensaje actual
-                historial = await obtener_historial(msg.telefono)
+                historial = await obtener_historial(user_id)
 
                 # Generar respuesta con Claude (usando contexto combinado)
                 respuesta = await generar_respuesta(combined_context, historial)
 
                 # Guardar TODOS los mensajes del usuario + respuesta única
                 for buffered_msg in completed_buffer["messages"]:
-                    await guardar_mensaje(msg.telefono, "user", buffered_msg["text"])
+                    await guardar_mensaje(user_id, "user", buffered_msg["text"])
 
-                await guardar_mensaje(msg.telefono, "assistant", respuesta)
+                await guardar_mensaje(user_id, "assistant", respuesta)
 
                 # Enviar respuesta UNA SOLA VEZ (no una por cada mensaje)
-                send_success = await proveedor.enviar_mensaje(msg.telefono, respuesta)
+                send_success = await proveedor.enviar_mensaje(user_id, respuesta)
 
                 duration_ms = int((time.time() - process_start) * 1000)
                 logger.info(
                     "RESPONSE_SENT",
                     extra={
-                        "user_id": msg.telefono,
+                        "user_id": user_id,
                         "duration_ms": duration_ms,
                         "response_length": len(respuesta),
                         "success": send_success,
@@ -165,7 +177,7 @@ async def webhook_handler(request: Request):
                 logger.error(
                     "BUFFER_PROCESS_FAILED",
                     extra={
-                        "user_id": msg.telefono,
+                        "user_id": user_id,
                         "msg_count": len(completed_buffer["messages"]),
                         "error": str(process_err),
                     },
@@ -173,7 +185,7 @@ async def webhook_handler(request: Request):
                 # Intenta enviar un mensaje de error al usuario
                 try:
                     await proveedor.enviar_mensaje(
-                        msg.telefono,
+                        user_id,
                         "Disculpa, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo.",
                     )
                 except:

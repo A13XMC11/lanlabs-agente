@@ -1,5 +1,4 @@
 # agent/buffer.py — Redis-backed message buffering para agrupar múltiples mensajes
-# Implementación de la skill whatsapp-agentkit en Python
 
 import os
 import json
@@ -19,15 +18,15 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # Configuración de timeouts
-BUFFER_TIMEOUT_MS = int(os.getenv("BUFFER_TIMEOUT_MS", 2500))  # 2.5 segundos
+BUFFER_TIMEOUT_MS = int(os.getenv("BUFFER_TIMEOUT_MS", 2500))  # 2.5 segundos de pausa para terminar
 MAX_BUFFER_AGE_MS = int(os.getenv("MAX_BUFFER_AGE_MS", 300000))  # 5 minutos
 BUFFER_KEY_PREFIX = "whatsapp:buffer:"
+BUFFER_PROCESSED_KEY_PREFIX = "whatsapp:processed:"  # Rastrea IDs procesados
 MAX_MESSAGES_PER_BUFFER = 15  # Backpressure limit
 REDIS_TIMEOUT = 5  # segundos para operaciones Redis
 
-# Storage para timers y eventos de completación
+# Storage para timers que están esperando
 _timers: Dict[str, asyncio.Task] = {}
-_buffer_events: Dict[str, asyncio.Event] = {}
 
 
 class MessageBuffer:
@@ -68,16 +67,25 @@ class MessageBuffer:
             # 1. REDIS AVAILABILITY CHECK
             if not self.connected:
                 logger.warning("REDIS_UNAVAILABLE", extra={"user_id": user_id})
-                # Degrada: devuelve inmediatamente el mensaje sin buffering
                 return {"messages": [{"text": text, "timestamp": timestamp, "message_id": message_id}]}
 
             buffer_key = f"{BUFFER_KEY_PREFIX}{user_id}"
+            processed_key = f"{BUFFER_PROCESSED_KEY_PREFIX}{user_id}"
 
-            # 2. GET EXISTING BUFFER
+            # 2. CHECK IF ALREADY PROCESSED (Global deduplication)
+            processed_ids = await self.redis_client.smembers(processed_key)
+            if message_id in processed_ids:
+                logger.info(
+                    "MESSAGE_ALREADY_PROCESSED",
+                    extra={"user_id": user_id, "message_id": message_id},
+                )
+                return None
+
+            # 3. GET EXISTING BUFFER
             buffer_json = await self.redis_client.get(buffer_key)
             buffer = json.loads(buffer_json) if buffer_json else None
 
-            # 3. DEDUPLICATION - Prevent webhook retry duplicates
+            # 4. DEDUPLICATION - Prevent webhook retry duplicates in current buffer
             if buffer and any(m["message_id"] == message_id for m in buffer["messages"]):
                 logger.info(
                     "BUFFER_DUPLICATE_SKIPPED",
@@ -85,7 +93,7 @@ class MessageBuffer:
                 )
                 return None
 
-            # 4. BACKPRESSURE CHECK
+            # 5. BACKPRESSURE CHECK
             if buffer and len(buffer["messages"]) >= MAX_MESSAGES_PER_BUFFER:
                 logger.error(
                     "BUFFER_OVERFLOW",
@@ -95,10 +103,9 @@ class MessageBuffer:
                         "max": MAX_MESSAGES_PER_BUFFER,
                     },
                 )
-                # Procesa inmediatamente
                 return buffer
 
-            # 5. CHECK BUFFER AGE - Prevent merging unrelated topics
+            # 6. CHECK BUFFER AGE - Prevent merging unrelated topics
             if buffer and (timestamp - buffer["buffer_created_at"]) > MAX_BUFFER_AGE_MS:
                 logger.info(
                     "BUFFER_AGE_EXCEEDED",
@@ -109,7 +116,7 @@ class MessageBuffer:
                 )
                 return buffer
 
-            # 6. APPEND OR CREATE
+            # 7. APPEND OR CREATE
             if buffer:
                 buffer["messages"].append(
                     {"text": text, "timestamp": timestamp, "message_id": message_id}
@@ -136,27 +143,11 @@ class MessageBuffer:
                 }
                 logger.info("BUFFER_START", extra={"user_id": user_id})
 
-            # 7. CLEAR EXISTING TIMER AND EVENTS
+            # 8. CLEAR EXISTING TIMER
             timer_key = f"{buffer_key}:timer"
             if timer_key in _timers:
                 _timers[timer_key].cancel()
-            if buffer_key in _buffer_events:
-                _buffer_events[buffer_key].clear()
-
-            # 8. SET NEW TIMER
-            async def timeout_handler():
-                await asyncio.sleep(BUFFER_TIMEOUT_MS / 1000)
-                # Señaliza que el buffer está listo
-                if buffer_key in _buffer_events:
-                    _buffer_events[buffer_key].set()
-                logger.info(
-                    "BUFFER_TIMEOUT_COMPLETED",
-                    extra={"user_id": user_id, "msg_count": len(buffer["messages"])},
-                )
-
-            task = asyncio.create_task(timeout_handler())
-            _timers[timer_key] = task
-            _buffer_events[buffer_key] = asyncio.Event()
+                del _timers[timer_key]
 
             # 9. SAVE BUFFER TO REDIS
             try:
@@ -166,28 +157,22 @@ class MessageBuffer:
                     "REDIS_WRITE_FAILED",
                     extra={"user_id": user_id, "error": str(redis_err)},
                 )
-                # Degrada: devuelve inmediatamente
                 return buffer
 
-            # 10. WAIT FOR TIMEOUT TO COMPLETE
-            event = _buffer_events[buffer_key]
-            try:
-                await asyncio.wait_for(event.wait(), timeout=BUFFER_TIMEOUT_MS / 1000 + 0.5)
-                # Timeout completado - devuelve el buffer
+            # 10. SET NEW TIMER - Espera pausa de mensajes antes de responder
+            async def timeout_handler():
+                await asyncio.sleep(BUFFER_TIMEOUT_MS / 1000)
+                # Marca el buffer como completado usando un flag en Redis
+                await self.redis_client.setex(f"{buffer_key}:ready", 10, "1")
                 logger.info(
-                    "BUFFER_COMPLETE",
+                    "BUFFER_TIMEOUT_TRIGGERED",
                     extra={"user_id": user_id, "msg_count": len(buffer["messages"])},
                 )
-                # Limpia
-                await self.redis_client.delete(buffer_key)
-                if timer_key in _timers:
-                    del _timers[timer_key]
-                if buffer_key in _buffer_events:
-                    del _buffer_events[buffer_key]
-                return buffer
-            except asyncio.TimeoutError:
-                # Fallback: devuelve el buffer aunque haya timeout
-                return buffer
+
+            task = asyncio.create_task(timeout_handler())
+            _timers[timer_key] = task
+
+            return None  # Sigue buffering, espera a que se complete el timeout
 
         except Exception as err:
             logger.error(
@@ -197,27 +182,52 @@ class MessageBuffer:
                     "error": str(err),
                 },
             )
-            # Fallback: devuelve el mensaje inmediatamente
             return {"messages": [{"text": text, "timestamp": timestamp, "message_id": message_id}]}
 
-    async def get_buffer(self, user_id: str) -> Optional[Dict]:
-        """Obtiene y limpia el buffer de un usuario."""
+    async def check_and_get_completed_buffer(self, user_id: str) -> Optional[Dict]:
+        """Verifica si el buffer está listo y lo devuelve si es así."""
         try:
             buffer_key = f"{BUFFER_KEY_PREFIX}{user_id}"
+            ready_key = f"{buffer_key}:ready"
+
+            # Verifica si el timeout se completó
+            is_ready = await self.redis_client.exists(ready_key)
+            if not is_ready:
+                return None
+
+            # Obtén el buffer
             buffer_json = await self.redis_client.get(buffer_key)
-            if buffer_json:
-                buffer = json.loads(buffer_json)
-                # Limpia el buffer
-                await self.redis_client.delete(buffer_key)
-                # Cancela el timer
-                timer_key = f"{buffer_key}:timer"
-                if timer_key in _timers:
-                    _timers[timer_key].cancel()
-                    del _timers[timer_key]
-                return buffer
-            return None
+            if not buffer_json:
+                return None
+
+            buffer = json.loads(buffer_json)
+
+            # Marca todos los mensajes como procesados
+            processed_key = f"{BUFFER_PROCESSED_KEY_PREFIX}{user_id}"
+            for msg in buffer["messages"]:
+                await self.redis_client.sadd(processed_key, msg["message_id"])
+
+            # TTL para processed_ids (7 días)
+            await self.redis_client.expire(processed_key, 7 * 24 * 3600)
+
+            # Limpia el buffer
+            await self.redis_client.delete(buffer_key)
+            await self.redis_client.delete(ready_key)
+
+            # Limpia el timer
+            timer_key = f"{buffer_key}:timer"
+            if timer_key in _timers:
+                _timers[timer_key].cancel()
+                del _timers[timer_key]
+
+            logger.info(
+                "BUFFER_COMPLETE",
+                extra={"user_id": user_id, "msg_count": len(buffer["messages"])},
+            )
+
+            return buffer
         except Exception as e:
-            logger.error("BUFFER_GET_FAILED", extra={"user_id": user_id, "error": str(e)})
+            logger.error("CHECK_BUFFER_ERROR", extra={"user_id": user_id, "error": str(e)})
             return None
 
     def combine_messages(self, messages: List[Dict]) -> str:
